@@ -47,7 +47,23 @@ def compute_group_normalized_reward(
         
         metadata: your choice of other statistics to log (e.g. mean, std, max/min of rewards).
     """
-    pass
+    for i in range(0, len(rollout_responses), group_size):
+        group_rewards_lst = []
+        group_responses = rollout_responses[i : i + group_size]
+        group_ground_truths = repeated_ground_truths[i : i + group_size]
+        for response, ground_truth in zip(group_responses, group_ground_truths):
+            group_rewards_lst.append(reward_fn(response, ground_truth)["reward"])
+        group_rewards = torch.tensor(group_rewards_lst)
+        group_advantages = group_rewards - group_rewards.mean()
+        if normalized_by_std:
+            group_advantages /= (group_rewards.std() + advantage_eps)
+        if i == 0:
+            advantages = group_advantages
+            raw_rewards = group_rewards
+        else:
+            advantages = torch.cat((advantages, group_advantages), dim = 0)
+            raw_rewards = torch.cat((raw_rewards, group_rewards), dim = 0)
+    return advantages, raw_rewards, {}
 
 def compute_grpo_clip_loss(
     advantages: torch.Tensor,
@@ -79,7 +95,16 @@ def compute_grpo_clip_loss(
         token was clipped or not, i.e., whether the clipped policy gradient loss on the RHS of
         the min was lower than the LHS.
     """
-    pass
+    ratio = torch.exp(policy_log_probs - old_log_probs)
+    clipped_ratio = torch.clamp(
+        ratio,
+        1.0 - cliprange,
+        1.0 + cliprange,
+    )
+    return -torch.min(
+        ratio * advantages,
+        clipped_ratio * advantages,
+    ), {}
 
 def masked_mean(
     tensor: torch.Tensor,
@@ -100,18 +125,18 @@ def masked_mean(
     Returns:
         torch.Tensor The masked mean; shape matches tensor.mean(dim) semantics.
     """
-    pass
+    return torch.sum(tensor * mask, dim=dim) / torch.sum(mask, dim=dim)
 
 
 def grpo_microbatch_train_step(
-        policy_log_probs: torch.Tensor,
-        response_mask: torch.Tensor,
-        gradient_accumulation_steps: int,
-        loss_type: Literal["grpo_clip"], # for this assignment, only "grpo_clip" is required
-        raw_rewards: torch.Tensor | None=None,
-        advantages: torch.Tensor | None=None,
-        old_log_probs: torch.Tensor | None=None,
-        cliprange: float | None=None
+    policy_log_probs: torch.Tensor,
+    response_mask: torch.Tensor,
+    gradient_accumulation_steps: int,
+    loss_type: Literal["grpo_clip"], # for this assignment, only "grpo_clip" is required
+    raw_rewards: torch.Tensor | None=None,
+    advantages: torch.Tensor | None=None,
+    old_log_probs: torch.Tensor | None=None,
+    cliprange: float | None=None
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """
     Execute one GRPO training microbatch step with gradient accumulation.
@@ -144,5 +169,14 @@ def grpo_microbatch_train_step(
         metadata Dict with metadata from the underlying loss call, and any other statistics you
         might want to log.
     """
-    pass
-
+    if loss_type != "grpo_clip":
+        raise ValueError(f"Unsupported loss_type: {loss_type}")
+    per_token_loss = compute_grpo_clip_loss(
+        advantages,
+        policy_log_probs,
+        old_log_probs,
+        cliprange
+    )[0]
+    loss = masked_mean(per_token_loss, response_mask) / gradient_accumulation_steps
+    loss.backward()
+    return loss, {}
