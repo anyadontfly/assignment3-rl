@@ -65,7 +65,7 @@ def load_checkpoint(
     # Call load_state_dict on both model and optimizer
     # Return the saved iteration number
     print(f"Loading checkpoint file: {src}")
-    checkpoint = torch.load(src)
+    checkpoint = torch.load(src, map_location=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
     model.load_state_dict(checkpoint['model_state'])
     if optimizer is not None:
         optimizer.load_state_dict(checkpoint['optimizer_state'])
