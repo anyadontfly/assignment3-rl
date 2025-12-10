@@ -293,7 +293,7 @@ class Generator:
         batch_rewards = []
         for i in range(N * G):
             keyword = keywords[i // G]
-            reward = 1.0 if keyword in batch_response_texts[i] else 0.0
+            reward = 1.0 if keyword.lower() in batch_response_texts[i].lower() else 0.0
             batch_rewards.append(reward)
         batch_rewards = torch.tensor(batch_rewards, dtype=torch.float, device=self.device)
         
