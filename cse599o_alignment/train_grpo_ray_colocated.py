@@ -46,7 +46,6 @@ D_MODEL = 512
 NUM_HEADS = 16
 D_FF = 1344
 THETA = 10000
-CHECKPOINT_PATH = "/app/assignment3-rl/checkpoints/ckpt_pretrained.pt"
 MAX_TOKENS = 60
 EOF_STR = "<|endoftext|>"
 EOF_TOKENS = tiktoken.get_encoding("gpt2").encode(EOF_STR, allowed_special={EOF_STR})
@@ -506,8 +505,13 @@ if __name__ == "__main__":
                        help="Number of prompts to process per batch")
     parser.add_argument("--steps-per-rollout-batch", type=int, default=1,
                        help="Number of gradient steps per rollout batch")
-    parser.add_argument("--tmp-dir", type=str, help="Temporary directory for Ray")
+    parser.add_argument("--tmp-dir", type=str, required=True, 
+                        help="Temporary directory for Ray")
+    parser.add_argument("--pretrained-ckpt-path", type=str, required=True,
+                       help="Path to pretrained model checkpoint")
     args = parser.parse_args()
+
+    CHECKPOINT_PATH = args.pretrained_ckpt_path
     
     ray.init(
         runtime_env={
