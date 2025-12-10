@@ -122,7 +122,8 @@ def run_training(
         if profile:
             transfer_end = time.perf_counter()
             print(f"Weight transfer time at step {step_count + 1}: {(transfer_end - transfer_start)*1000:.4f} ms.", flush=True)
-        print(f"Step {step_count + 1} weights transferred.", flush=True)
+        else:
+            print(f"Step {step_count + 1} weights transferred.", flush=True)
 
     for _ in range(steps_per_rollout_batch):
         loss_ref = learner.update_policy.remote(
