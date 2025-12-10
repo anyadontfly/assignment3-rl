@@ -96,33 +96,62 @@ class Trajectory:
         self.response_masks = response_masks
 
 
-def compute_policy_log_probs(model, tokenizer, device, trajectories: List[Trajectory]) -> torch.Tensor:
+def compute_log_probs(model, tokenizer, device, trajectories: List[Trajectory]) -> torch.Tensor:
         """Compute log probabilities for generated responses."""
         N = len(trajectories)
         policy_log_probs = torch.zeros(N, G, MAX_TOKENS, dtype=torch.float, device=device)
         
-        for i, traj in enumerate(trajectories):
-            prompt_tokens = tokenizer.encode(traj.prompt, allowed_special={EOF_STR})
-            prompt_tensor = torch.tensor([prompt_tokens], dtype=torch.long, device=device)
-            
+        prompt_token_lists = [tokenizer.encode(traj.prompt, allowed_special={EOF_STR}) for traj in trajectories]
+        prompt_lengths = [len(tokens) for tokens in prompt_token_lists]
+        max_prompt_len = max(prompt_lengths)
+        
+        padded_prompts = torch.zeros(N, max_prompt_len, dtype=torch.long, device=device)
+        for i, tokens in enumerate(prompt_token_lists):
+            padded_prompts[i, :len(tokens)] = torch.tensor(tokens, dtype=torch.long, device=device)
+        
+        batch_prompts = padded_prompts.repeat_interleave(G, dim=0)  # (N*G, max_prompt_len)
+        batch_prompt_lengths = [prompt_lengths[i // G] for i in range(N * G)]
+        
+        batch_responses = torch.zeros(N * G, MAX_TOKENS, dtype=torch.long, device=device)
+        batch_masks = torch.zeros(N * G, MAX_TOKENS, dtype=torch.float, device=device)
+        
+        for i in range(N):
             for g in range(G):
-                response_tokens = traj.responses[g]
-                mask = traj.response_masks[g]
-                
-                for t in range(MAX_TOKENS):
-                    if mask[t] == 0:
-                        break
-                    input_ids = torch.cat(
-                        [
-                            prompt_tensor,
-                            response_tokens[:t].unsqueeze(0)
-                        ], dim=1
-                    )
-                    logits = model(input_ids)
-                    next_token_logits = logits[0, -1, :]
-                    log_probs = torch.log_softmax(next_token_logits, dim=-1)
-                    token_id = response_tokens[t].item()
-                    policy_log_probs[i, g, t] = log_probs[token_id]
+                batch_idx = i * G + g
+                batch_responses[batch_idx] = trajectories[i].responses[g]
+                batch_masks[batch_idx] = trajectories[i].response_masks[g]
+        
+        max_response_len = int(batch_masks.sum(dim=1).max().item())
+        for t in range(max_response_len):
+            input_ids_list = []
+            valid_indices = []
+            
+            for i in range(N * G):
+                if batch_masks[i, t] > 0:
+                    prompt_len = batch_prompt_lengths[i]
+                    prompt_part = batch_prompts[i, :prompt_len]
+                    response_part = batch_responses[i, :t]
+                    input_ids = torch.cat([prompt_part, response_part])
+                    input_ids_list.append(input_ids)
+                    valid_indices.append(i)
+            
+            if len(input_ids_list) == 0:
+                break
+            
+            max_len = max(len(ids) for ids in input_ids_list)
+            padded_input_ids = torch.zeros(len(input_ids_list), max_len, dtype=torch.long, device=device)
+            for idx, ids in enumerate(input_ids_list):
+                padded_input_ids[idx, :len(ids)] = ids
+            
+            logits = model(padded_input_ids)  # (batch_size, max_len, vocab_size)
+            next_token_logits = logits[:, -1, :]  # (batch_size, vocab_size)
+            log_probs = torch.log_softmax(next_token_logits, dim=-1)  # (batch_size, vocab_size)
+            
+            for idx, batch_idx in enumerate(valid_indices):
+                token_id = batch_responses[batch_idx, t].item()
+                n_idx = batch_idx // G
+                g_idx = batch_idx % G
+                policy_log_probs[n_idx, g_idx, t] = log_probs[idx, token_id]
         
         return policy_log_probs
 
@@ -156,65 +185,90 @@ class Generator:
         - Calculate log probabilities for generated tokens
         - Return list of Trajectory objects with prompts, responses, log_probs
         """
-        trajs: List[Trajectory] = []
-
-        for prompt in prompts:
-            prompt_tokens = self.tokenizer.encode(prompt, allowed_special={EOF_STR})
-            prompt_tensor = torch.tensor([prompt_tokens], dtype=torch.long, device=self.device)
-            keyword = prompt.split()[-1]
+        N = len(prompts)
+        keywords = [prompt.split()[-1] for prompt in prompts]
+        
+        prompt_token_lists = [self.tokenizer.encode(p, allowed_special={EOF_STR}) for p in prompts]
+        prompt_lengths = [len(tokens) for tokens in prompt_token_lists]
+        max_prompt_len = max(prompt_lengths)
+        
+        padded_prompts = torch.zeros(N, max_prompt_len, dtype=torch.long, device=self.device)
+        for i, tokens in enumerate(prompt_token_lists):
+            padded_prompts[i, :len(tokens)] = torch.tensor(tokens, dtype=torch.long, device=self.device)
+        
+        batch_prompts = padded_prompts.repeat_interleave(G, dim=0)  # (N*G, max_prompt_len)
+        batch_prompt_lengths = [prompt_lengths[i // G] for i in range(N * G)]
+        
+        input_ids = batch_prompts.clone()  # (N*G, max_prompt_len)
+        batch_log_probs = []
+        finished = torch.zeros(N * G, dtype=torch.bool, device=self.device)
+        
+        for _ in range(MAX_TOKENS):
+            logits = self.generator_model(input_ids)  # (N*G, seq_len, vocab_size)
+            next_token_logits = logits[:, -1, :]  # (N*G, vocab_size)
             
-            rollout_responses = []
-            rollout_log_probs = []
-            rollout_rewards = []
-            rollout_masks = []
+            log_probs = torch.log_softmax(next_token_logits, dim=-1)  # (N*G, vocab_size)
+            next_tokens = torch.multinomial(torch.exp(log_probs), num_samples=1).squeeze(1)  # (N*G,)
+            token_log_probs = log_probs.gather(1, next_tokens.unsqueeze(1)).squeeze(1)  # (N*G,)
+            batch_log_probs.append(token_log_probs)
             
-            for _ in range(G):
-                input_ids = prompt_tensor.clone()
-                response_log_probs = []
-                
-                for _ in range(MAX_TOKENS):
-                    logits = self.generator_model(input_ids)
-                    next_token_logits = logits[0, -1, :]
-
-                    log_probs = torch.log_softmax(next_token_logits, dim=-1)
-                    next_token = torch.multinomial(torch.exp(log_probs), num_samples=1)
-                    response_log_probs.append(log_probs[next_token.item()])
-                    input_ids = torch.cat([input_ids, next_token.unsqueeze(0)], dim=1)
-                    
-                    if next_token.item() in EOF_TOKENS:
-                        break
-                
-                response_tokens = input_ids[0, len(prompt_tokens):].cpu().tolist()
-                response_text = self.tokenizer.decode(response_tokens)
-                reward = 1.0 if keyword in response_text else 0.0
-
-                # if reward == 1.0:
-                #     print(f"Generated response includes keyword '{keyword}': {response_text}")
-                
-                rollout_responses.append(torch.tensor(response_tokens, dtype=torch.long, device=self.device))
-                rollout_log_probs.append(torch.stack(response_log_probs))
-                rollout_rewards.append(reward)
-                rollout_masks.append(torch.ones(len(response_log_probs), dtype=torch.float, device=self.device))
+            input_ids = torch.cat([input_ids, next_tokens.unsqueeze(1)], dim=1)  # (N*G, seq_len+1)
             
-            padded_responses = torch.zeros(G, MAX_TOKENS, dtype=torch.long, device=self.device)
-            padded_log_probs = torch.zeros(G, MAX_TOKENS, dtype=torch.float, device=self.device)
-            padded_masks = torch.zeros(G, MAX_TOKENS, dtype=torch.float, device=self.device)
+            for eof_token in EOF_TOKENS:
+                finished |= (next_tokens == eof_token)
             
-            for i in range(G):
-                seq_len = len(rollout_responses[i])
-                padded_responses[i, :seq_len] = rollout_responses[i]
-                padded_log_probs[i, :seq_len] = rollout_log_probs[i]
-                padded_masks[i, :seq_len] = rollout_masks[i]
+            if finished.all():
+                break
+        
+        batch_log_probs = torch.stack(batch_log_probs, dim=1)  # (N*G, actual_len)
+        actual_len = batch_log_probs.size(1)
+        
+        if actual_len < MAX_TOKENS:
+            padding = torch.zeros(N * G, MAX_TOKENS - actual_len, dtype=torch.float, device=self.device)
+            batch_log_probs = torch.cat([batch_log_probs, padding], dim=1)
+        
+        batch_responses = torch.zeros(N * G, MAX_TOKENS, dtype=torch.long, device=self.device)
+        batch_masks = torch.zeros(N * G, MAX_TOKENS, dtype=torch.float, device=self.device)
+        batch_response_texts = []
+        
+        for i in range(N * G):
+            prompt_len = batch_prompt_lengths[i]
+            response_tokens = input_ids[i, prompt_len:].cpu().tolist()
+            response_len = min(len(response_tokens), MAX_TOKENS)
+            
+            batch_responses[i, :response_len] = torch.tensor(response_tokens[:response_len], dtype=torch.long, device=self.device)
+            
+            eof_position = response_len
+            for pos, token in enumerate(response_tokens[:response_len]):
+                if token in EOF_TOKENS:
+                    eof_position = pos
+                    break
+            batch_masks[i, :eof_position] = 1.0
+            
+            response_text = self.tokenizer.decode(response_tokens[:response_len])
+            batch_response_texts.append(response_text)
+        
+        batch_rewards = []
+        for i in range(N * G):
+            keyword = keywords[i // G]
+            reward = 1.0 if keyword in batch_response_texts[i] else 0.0
+            batch_rewards.append(reward)
+        batch_rewards = torch.tensor(batch_rewards, dtype=torch.float, device=self.device)
+        
+        trajs = []
+        for i in range(N):
+            start_idx = i * G
+            end_idx = start_idx + G
             
             traj = Trajectory(
-                prompt=prompt,
-                responses=padded_responses,
-                log_probs=padded_log_probs,
-                rewards=torch.tensor(rollout_rewards, dtype=torch.float, device=self.device),
-                response_masks=padded_masks,
+                prompt=prompts[i],
+                responses=batch_responses[start_idx:end_idx],  # (G, MAX_TOKENS)
+                log_probs=batch_log_probs[start_idx:end_idx],  # (G, MAX_TOKENS)
+                rewards=batch_rewards[start_idx:end_idx],  # (G,)
+                response_masks=batch_masks[start_idx:end_idx],  # (G, MAX_TOKENS)
             )
             trajs.append(traj)
-
+        
         return trajs
 
 
@@ -257,7 +311,7 @@ class Learner:
         ref_model: Optional[Transformer]=None,
     ) -> float:
         self.optimizer.zero_grad()
-        policy_log_probs = compute_policy_log_probs(
+        policy_log_probs = compute_log_probs(
             self.learner_model,
             self.tokenizer,
             self.device,
@@ -279,14 +333,14 @@ class Learner:
 
         if monitor_kl_div:
             with torch.no_grad():
-                ref_log_probs = compute_policy_log_probs(
+                ref_log_probs = compute_log_probs(
                     ref_model,
                     self.tokenizer,
                     self.device,
                     trajectories,
                 )
 
-                updated_policy_log_probs = compute_policy_log_probs(
+                updated_policy_log_probs = compute_log_probs(
                     self.learner_model,
                     self.tokenizer,
                     self.device,
@@ -452,26 +506,26 @@ if __name__ == "__main__":
                        help="Number of prompts to process per batch")
     parser.add_argument("--steps-per-rollout-batch", type=int, default=1,
                        help="Number of gradient steps per rollout batch")
+    parser.add_argument("--tmp-dir", type=str, help="Temporary directory for Ray")
     args = parser.parse_args()
     
     ray.init(
         runtime_env={
             "excludes": [
-                ".git/**",  # git metadata and objects
-                ".venv/**",  # virtual environment
-                "tests/fixtures/**",  # test fixtures (large model files)
-                "*.nsys-rep",  # profiling files
-                # "*.pt",
-                # "*.pth",
-                # "*.safetensors",  # model weight files
-                "*.tar",
-                "*.zip",
-                "*.gz",  # archives
-                "__pycache__/**",  # Python cache
-                "*.egg-info/**",  # package info
+                ".git/**",                           # git metadata and objects
+                ".venv/**",                          # virtual environment
+                "submission_*/**",                   # submission folders (6.9GB)
+                "checkpoint/**",                     # checkpoint folder (731MB)
+                "tests/fixtures/**",                 # test fixtures (large model files)
+                "wandb/**",                          # wandb logs
+                "*.nsys-rep",                        # profiling files
+                # "*.pt", "*.pth", "*.safetensors",   # model weight files
+                "*.tar", "*.zip", "*.gz",           # archives
+                "__pycache__/**",                   # Python cache
+                "*.egg-info/**"                     # package info
             ]
         },
-        _temp_dir="/app/ray_tmp",
+        _temp_dir=args.tmp_dir,
         ignore_reinit_error=True,
     )
     
