@@ -167,7 +167,7 @@ def compute_log_probs(model, tokenizer, device, trajectories: List[Trajectory]) 
 class Generator:
     """Base class for text generation using TransformerLM"""
 
-    def __init__(self):
+    def __init__(self, ckpt_path: str):
         self.device = get_device()
         self.generator_model = Transformer(
             d_model=D_MODEL,
@@ -179,7 +179,7 @@ class Generator:
             rope_theta=THETA,
             device=self.device,
         )
-        load_checkpoint(CHECKPOINT_PATH, self.generator_model, None)
+        load_checkpoint(ckpt_path, self.generator_model, None)
         self.tokenizer = tiktoken.get_encoding("gpt2")
 
     @torch.no_grad()
@@ -310,7 +310,7 @@ class Generator:
 
 class Learner:
     """Base learner class for policy gradient updates using TransformerLM."""
-    def __init__(self):
+    def __init__(self, ckpt_path: str):
         self.device = get_device()
         self.learner_model = Transformer(
             d_model=D_MODEL,
@@ -322,7 +322,7 @@ class Learner:
             rope_theta=THETA,
             device=self.device,
         )
-        load_checkpoint(CHECKPOINT_PATH, self.learner_model, None)
+        load_checkpoint(ckpt_path, self.learner_model, None)
         self.tokenizer = tiktoken.get_encoding("gpt2")
         self.optimizer = torch.optim.AdamW(self.learner_model.parameters(), 1e-5)
     
@@ -341,8 +341,6 @@ class Learner:
         self,
         trajectories: List[Trajectory],
         advantages: torch.Tensor,
-        old_log_probs: torch.Tensor,
-        response_masks: torch.Tensor,
         steps_per_rollout_batch: int,
         monitor_kl_div: bool=False,
         ref_model: Optional[Transformer]=None,
@@ -411,15 +409,20 @@ class Learner:
 @ray.remote(num_gpus=1)
 class ColocatedWorker(Generator, Learner):
     """Combined Generator and Learner in a single Ray actor."""
-    def __init__(self, monitor_kl_div: bool=False, steps_per_rollout_batch: int=1):
+    def __init__(
+        self,
+        ckpt_path: str,
+        monitor_kl_div: bool=False,
+        steps_per_rollout_batch: int=1,
+    ):
         if torch.cuda.is_available():
             torch.set_default_device("cuda")
 
         self.device = get_device()
         self.monitor_kl_div = monitor_kl_div
         
-        Generator.__init__(self)
-        Learner.__init__(self)
+        Generator.__init__(self, ckpt_path)
+        Learner.__init__(self, ckpt_path)
         if monitor_kl_div:
             self.ref_model = Transformer(
                 d_model=D_MODEL,
@@ -498,6 +501,7 @@ class ColocatedWorker(Generator, Learner):
 # ===================== Training loop =====================
 
 def run_training(
+    ckpt_path: str,
     prompts: List[str],
     num_steps: int,
     num_workers: int = 1,
@@ -506,7 +510,11 @@ def run_training(
     steps_per_rollout_batch: int=1,
 ):
     """Run colocated GRPO training with text generation."""
-    worker = ColocatedWorker.remote(monitor_kl_div=monitor_kl_div, steps_per_rollout_batch=steps_per_rollout_batch)
+    worker = ColocatedWorker.remote(
+        ckpt_path=ckpt_path,
+        monitor_kl_div=monitor_kl_div,
+        steps_per_rollout_batch=steps_per_rollout_batch,
+    )
     for step in range(0, num_steps, steps_per_rollout_batch):
         # start_idx = step * prompts_per_batch * steps_per_rollout_batch
         # end_idx = start_idx + prompts_per_batch * steps_per_rollout_batch
@@ -514,6 +522,7 @@ def run_training(
         ray.get(worker.training_step.remote(prompts_step, monitor_kl_div=monitor_kl_div))
 
 def run_once(
+    ckpt_path: str,
     keywords_file: str,
     num_steps: int,
     num_workers: int = 1,
@@ -525,7 +534,15 @@ def run_once(
     with open(keywords_file, "r") as f:
         keywords = [line.strip() for line in f.readlines()]
     prompts = make_keyword_inclusion_prompts(keywords)
-    run_training(prompts, num_steps, num_workers, monitor_kl_div=monitor_kl_div, prompts_per_batch=prompts_per_batch, steps_per_rollout_batch=steps_per_rollout_batch)
+    run_training(
+        ckpt_path,
+        prompts,
+        num_steps,
+        num_workers,
+        monitor_kl_div=monitor_kl_div,
+        prompts_per_batch=prompts_per_batch,
+        steps_per_rollout_batch=steps_per_rollout_batch,
+    )
 
 
 # ===================== Entry point =====================
@@ -549,8 +566,6 @@ if __name__ == "__main__":
     parser.add_argument("--pretrained-ckpt-path", type=str, required=True,
                        help="Path to pretrained model checkpoint")
     args = parser.parse_args()
-
-    CHECKPOINT_PATH = args.pretrained_ckpt_path
     
     ray.init(
         runtime_env={
@@ -574,6 +589,7 @@ if __name__ == "__main__":
     
     try:
         run_once(
+            ckpt_path=args.pretrained_ckpt_path,
             keywords_file=args.keywords_file,
             num_steps=args.steps,
             num_workers=args.workers,

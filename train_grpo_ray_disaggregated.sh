@@ -6,4 +6,5 @@ uv run -m cse599o_alignment.train_grpo_ray_disaggregated \
 --pretrained-ckpt-path /homes/iws/puyuan/cse599o/assignment3-rl/checkpoints/ckpt_pretrained.pt \
 --steps 64 \
 --prompts-per-batch 32 \
---workers 2
+--workers 2 \
+--use-rdt

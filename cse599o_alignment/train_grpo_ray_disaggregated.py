@@ -9,6 +9,7 @@ import argparse
 import time
 import numpy as np
 import ray
+from ray.experimental.collective import create_collective_group
 import torch
 from typing import List, Dict, Any, Optional
 
@@ -24,8 +25,8 @@ from cse599o_alignment.train_grpo_ray_colocated import (
 
 @ray.remote(num_gpus=1)
 class GeneratorWorker(Generator):
-    def __init__(self):
-        super().__init__()
+    def __init__(self, ckpt_path: str,):
+        super().__init__(ckpt_path)
 
     def set_weights(self, state_dict: Dict[str, Any]) -> None:
         torch.cuda.synchronize()
@@ -34,26 +35,34 @@ class GeneratorWorker(Generator):
 
 @ray.remote(num_gpus=1)
 class LearnerWorker(Learner):
-    def __init__(self):
-        super().__init__()
+    def __init__(self, ckpt_path: str,):
+        super().__init__(ckpt_path)
 
     def get_weights(self) -> Dict[str, Any]:
         torch.cuda.synchronize()
-        return self.generator_model.state_dict()
+        return self.learner_model.state_dict()
+    
+    @ray.method(tensor_transport="nccl")
+    def get_weights_rdt(self) -> Dict[str, Any]:
+        torch.cuda.synchronize()
+        return self.learner_model.state_dict()
 
 
 # ===================== Training loop =====================
 
 def run_training(
+    ckpt_path: str,
     keywords_file: str,
     num_steps: int = 10,
     num_workers: int = 2,
     prompts_per_batch: int = 4,
+    use_rdt: bool = False,
 ) -> None:
     """
     Run disaggregated GRPO training.
     
     Args:
+        ckpt_path: Path to pretrained model checkpoint
         keywords_file: Path to keywords file
         num_steps: Number of training steps
         num_workers: Must be 2 (generator + learner)
@@ -69,8 +78,11 @@ def run_training(
         keywords = [line.strip() for line in f.readlines()]
 
     print("Creating generator and learner workers...")
-    generator = GeneratorWorker.remote()
-    learner = LearnerWorker.remote()
+    generator = GeneratorWorker.remote(ckpt_path=ckpt_path)
+    learner = LearnerWorker.remote(ckpt_path=ckpt_path)
+
+    if use_rdt:
+        create_collective_group([generator, learner], backend="nccl")
 
     with open(keywords_file, "r") as f:
         keywords = [line.strip() for line in f.readlines()]
@@ -90,7 +102,10 @@ def run_training(
             1,
         )
 
-        updated_weights = learner.get_weights.remote()
+        if use_rdt:
+            updated_weights = learner.get_weights_rdt.remote()
+        else:
+            updated_weights = learner.get_weights.remote()
         ray.get(generator.set_weights.remote(updated_weights))
 
         # Send trajectories to learner for policy update
@@ -106,18 +121,22 @@ def run_training(
 
 
 def run_once(
+    ckpt_path: str,
     keywords_file: str,
     num_steps: int = 10,
     num_workers: int = 2,
     prompts_per_batch: int = 4,
+    use_rdt: bool = False,
     **kwargs
 ):
     """Entry point for disaggregated training."""
     run_training(
+        ckpt_path=ckpt_path,
         keywords_file=keywords_file,
         num_steps=num_steps,
         num_workers=num_workers,
         prompts_per_batch=prompts_per_batch,
+        use_rdt=use_rdt,
     )
 
 
@@ -162,10 +181,12 @@ if __name__ == "__main__":
         required=True,
         help="Path to pretrained model checkpoint",
     )
+    parser.add_argument(
+        "--use-rdt",
+        action="store_true",
+        help="Use Ray Distributed Tensor (RDT) for weight transfer",
+    )
     args = parser.parse_args()
-
-    import cse599o_alignment.train_grpo_ray_colocated as colocated_module
-    colocated_module.CHECKPOINT_PATH = args.pretrained_ckpt_path
 
     ray.init(
         runtime_env={
@@ -190,10 +211,12 @@ if __name__ == "__main__":
 
     try:
         run_once(
+            ckpt_path=args.pretrained_ckpt_path,
             keywords_file=args.keywords_file,
             num_steps=args.steps,
             num_workers=args.workers,
             prompts_per_batch=args.prompts_per_batch,
+            use_rdt=args.use_rdt,
         )
     finally:
         ray.shutdown()
