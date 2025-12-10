@@ -330,7 +330,7 @@ class Learner:
         )
         load_checkpoint(CHECKPOINT_PATH, self.learner_model, None)
         self.tokenizer = tiktoken.get_encoding("gpt2")
-        self.optimizer = torch.optim.AdamW(self.learner_model.parameters(), **OPTIM_ARGS)
+        self.optimizer = torch.optim.AdamW(self.learner_model.parameters(), 1e-5)
     
     def compute_advantages(self, trajectories: List[Trajectory]) -> torch.Tensor:
         """Compute advantages for GRPO."""
