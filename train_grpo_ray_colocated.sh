@@ -6,5 +6,5 @@ uv run -m  cse599o_alignment.train_grpo_ray_colocated \
 --pretrained-ckpt-path /homes/iws/puyuan/cse599o/assignment3-rl/checkpoints/ckpt_pretrained.pt \
 --steps 64 \
 --prompts-per-batch 4 \
---steps-per-rollout-batch 1
+--steps-per-rollout-batch 8
 # --monitor-kl-div

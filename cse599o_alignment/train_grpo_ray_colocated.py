@@ -36,7 +36,7 @@ from cse599o_alignment.grpo import grpo_microbatch_train_step
 # ===================== Basic setup =====================
 
 G = 4  # group size (number of responses per prompt)
-MAX_BATCH_SIZE = 32
+MAX_BATCH_SIZE = 16
 VOCAB_SIZE = tiktoken.get_encoding("gpt2").n_vocab
 CONTEXT_LENGTH = 256
 NUM_LAYERS = 4
@@ -107,7 +107,7 @@ def compute_log_probs(model, tokenizer, device, trajectories: List[Trajectory]) 
             padded_prompts[i, :len(tokens)] = torch.tensor(tokens, dtype=torch.long, device=device)
         
         batch_prompts = padded_prompts.repeat_interleave(G, dim=0)  # (N*G, max_prompt_len)
-        batch_prompt_lengths = [prompt_lengths[i // G] for i in range(N * G)]
+        batch_prompt_lengths = torch.tensor([prompt_lengths[i // G] for i in range(N * G)], dtype=torch.long, device=device)
         
         batch_responses = torch.zeros(N * G, MAX_TOKENS, dtype=torch.long, device=device)
         batch_masks = torch.zeros(N * G, MAX_TOKENS, dtype=torch.float, device=device)
@@ -118,49 +118,46 @@ def compute_log_probs(model, tokenizer, device, trajectories: List[Trajectory]) 
                 batch_responses[batch_idx] = trajectories[i].responses[g]
                 batch_masks[batch_idx] = trajectories[i].response_masks[g]
         
-        max_response_len = int(batch_masks.sum(dim=1).max().item())
-        for t in range(max_response_len):
-            input_ids_list = []
-            valid_indices = []
+        total_sequences = N * G
+        num_batches = (total_sequences + MAX_BATCH_SIZE - 1) // MAX_BATCH_SIZE
+        
+        for batch_idx in range(num_batches):
+            start_idx = batch_idx * MAX_BATCH_SIZE
+            end_idx = min(start_idx + MAX_BATCH_SIZE, total_sequences)
+            batch_size = end_idx - start_idx
             
-            for i in range(N * G):
-                if batch_masks[i, t] > 0:
-                    prompt_len = batch_prompt_lengths[i]
-                    prompt_part = batch_prompts[i, :prompt_len]
-                    response_part = batch_responses[i, :t]
-                    input_ids = torch.cat([prompt_part, response_part])
-                    input_ids_list.append(input_ids)
-                    valid_indices.append(i)
+            batch_input_ids_list = []
+            batch_prompt_lens = []
             
-            if len(input_ids_list) == 0:
-                break
-            
-            max_len = max(len(ids) for ids in input_ids_list)
-            
-            # Process in batches if number of valid sequences exceeds MAX_BATCH_SIZE
-            num_valid = len(input_ids_list)
-            num_sub_batches = (num_valid + MAX_BATCH_SIZE - 1) // MAX_BATCH_SIZE
-            
-            for sub_batch_idx in range(num_sub_batches):
-                sub_start = sub_batch_idx * MAX_BATCH_SIZE
-                sub_end = min(sub_start + MAX_BATCH_SIZE, num_valid)
-                sub_batch_size = sub_end - sub_start
+            for i in range(start_idx, end_idx):
+                prompt_len = batch_prompt_lengths[i].item()
+                prompt_part = batch_prompts[i, :prompt_len]
+                response_part = batch_responses[i]
+                full_input = torch.cat([prompt_part, response_part])
                 
-                padded_input_ids = torch.zeros(sub_batch_size, max_len, dtype=torch.long, device=device)
-                for idx in range(sub_batch_size):
-                    ids = input_ids_list[sub_start + idx]
-                    padded_input_ids[idx, :len(ids)] = ids
+                batch_input_ids_list.append(full_input)
+                batch_prompt_lens.append(prompt_len)
+            
+            max_len = max(len(ids) for ids in batch_input_ids_list)
+            padded_input_ids = torch.zeros(batch_size, max_len, dtype=torch.long, device=device)
+            for idx, ids in enumerate(batch_input_ids_list):
+                padded_input_ids[idx, :len(ids)] = ids
+            
+            logits = model(padded_input_ids)  # (batch_size, max_len, vocab_size)
+            
+            for idx, seq_idx in enumerate(range(start_idx, end_idx)):
+                prompt_len = batch_prompt_lens[idx]
+                response_logits = logits[idx, prompt_len - 1 : prompt_len + MAX_TOKENS - 1, :]  # (MAX_TOKENS, vocab_size)
                 
-                logits = model(padded_input_ids)  # (sub_batch_size, max_len, vocab_size)
-                next_token_logits = logits[:, -1, :] / SAMPLING_TEMPERATURE  # (sub_batch_size, vocab_size)
-                log_probs = torch.log_softmax(next_token_logits, dim=-1)  # (sub_batch_size, vocab_size)
+                scaled_logits = response_logits / SAMPLING_TEMPERATURE
+                log_probs_vocab = torch.log_softmax(scaled_logits, dim=-1)  # (MAX_TOKENS, vocab_size)
                 
-                for idx in range(sub_batch_size):
-                    batch_idx = valid_indices[sub_start + idx]
-                    token_id = batch_responses[batch_idx, t].item()
-                    n_idx = batch_idx // G
-                    g_idx = batch_idx % G
-                    policy_log_probs[n_idx, g_idx, t] = log_probs[idx, token_id]
+                response_tokens = batch_responses[seq_idx].unsqueeze(-1)  # (MAX_TOKENS, 1)
+                log_probs = torch.gather(log_probs_vocab, dim=1, index=response_tokens).squeeze(-1)  # (MAX_TOKENS,)
+                
+                n_idx = seq_idx // G
+                g_idx = seq_idx % G
+                policy_log_probs[n_idx, g_idx] = log_probs
         
         return policy_log_probs
 
@@ -494,7 +491,7 @@ def run_training(
 ):
     """Run colocated GRPO training with text generation."""
     worker = ColocatedWorker.remote(monitor_kl_div=monitor_kl_div, steps_per_rollout_batch=steps_per_rollout_batch)
-    for step in range(num_steps):
+    for step in range(0, num_steps, steps_per_rollout_batch):
         start_idx = step * prompts_per_batch * steps_per_rollout_batch
         end_idx = start_idx + prompts_per_batch * steps_per_rollout_batch
         prompts_step = prompts[start_idx:end_idx]
