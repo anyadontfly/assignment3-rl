@@ -1,12 +1,11 @@
 #!/bin/bash
 
 uv run -m  cse599o_alignment.train_grpo_ray_colocated \
---tmp-dir /app/ray_tmp \
---keywords-file /app/assignment3-rl/cse599o_alignment/prompts/keywords.txt \
---pretrained-ckpt-path /app/assignment3-rl/checkpoints/ckpt_pretrained.pt \
---steps 64 \
---prompts-per-batch 32 \
+--tmp-dir /homes/iws/puyuan/ray_tmp \
+--keywords-file /homes/iws/puyuan/cse599o/assignment3-rl/cse599o_alignment/prompts/keywords.txt \
+--pretrained-ckpt-path /homes/iws/puyuan/cse599o/assignment3-rl/checkpoints/ckpt_pretrained.pt \
+--steps 32 \
+--prompts-per-batch 4 \
 --steps-per-rollout-batch 1 \
 --profile
-
-# --monitor-kl-div \
+# --monitor-kl-div

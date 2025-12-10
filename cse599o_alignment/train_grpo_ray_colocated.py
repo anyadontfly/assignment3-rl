@@ -331,7 +331,7 @@ class Learner:
         )
         load_checkpoint(ckpt_path, self.learner_model, None)
         self.tokenizer = tiktoken.get_encoding("gpt2")
-        self.optimizer = torch.optim.AdamW(self.learner_model.parameters(), 1e-5)
+        self.optimizer = torch.optim.AdamW(self.learner_model.parameters(), 5e-4)
         self.learner_stats = {
             "computed_advantages_times": [],
             "policy_update_times": [],
@@ -474,9 +474,11 @@ class ColocatedWorker(Generator, Learner):
         gen_traj_end_time = time.perf_counter()
         
         loss = -1.0
-        for _ in range(self.steps_per_rollout_batch):
+        for i in range(self.steps_per_rollout_batch):
+            div = len(trajectories) // self.steps_per_rollout_batch
+            rollout_step_trajectories = trajectories[i * div:(i + 1) * div]
             loss = self.update_policy(
-                trajectories,
+                rollout_step_trajectories,
                 self.steps_per_rollout_batch,
                 monitor_kl_div=monitor_kl_div,
                 ref_model=self.ref_model if monitor_kl_div else None,
@@ -486,7 +488,7 @@ class ColocatedWorker(Generator, Learner):
         self.sync_models()
         torch.cuda.synchronize()
         step_end_time = time.perf_counter()
-        
+
         wall_time = (step_end_time - step_start_time) * 1000
         gen_traj_time = (gen_traj_end_time - step_start_time) * 1000
         policy_update_time = (policy_update_end_time - gen_traj_end_time) * 1000
