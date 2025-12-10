@@ -30,15 +30,13 @@ import random
 from cse599o_basics.model import Transformer, softmax
 from cse599o_basics.optimizer import AdamW
 from cse599o_basics.utils import save_checkpoint, load_checkpoint, gradient_clipping
-from cse599o_alignment.grpo import (
-    compute_group_normalized_reward,
-    grpo_microbatch_train_step,
-)
+from cse599o_alignment.grpo import grpo_microbatch_train_step
 
 
 # ===================== Basic setup =====================
 
 G = 4  # group size (number of responses per prompt)
+MAX_BATCH_SIZE = 32
 VOCAB_SIZE = tiktoken.get_encoding("gpt2").n_vocab
 CONTEXT_LENGTH = 256
 NUM_LAYERS = 4
@@ -138,19 +136,31 @@ def compute_log_probs(model, tokenizer, device, trajectories: List[Trajectory]) 
                 break
             
             max_len = max(len(ids) for ids in input_ids_list)
-            padded_input_ids = torch.zeros(len(input_ids_list), max_len, dtype=torch.long, device=device)
-            for idx, ids in enumerate(input_ids_list):
-                padded_input_ids[idx, :len(ids)] = ids
             
-            logits = model(padded_input_ids)  # (batch_size, max_len, vocab_size)
-            next_token_logits = logits[:, -1, :]  # (batch_size, vocab_size)
-            log_probs = torch.log_softmax(next_token_logits, dim=-1)  # (batch_size, vocab_size)
+            # Process in batches if number of valid sequences exceeds MAX_BATCH_SIZE
+            num_valid = len(input_ids_list)
+            num_sub_batches = (num_valid + MAX_BATCH_SIZE - 1) // MAX_BATCH_SIZE
             
-            for idx, batch_idx in enumerate(valid_indices):
-                token_id = batch_responses[batch_idx, t].item()
-                n_idx = batch_idx // G
-                g_idx = batch_idx % G
-                policy_log_probs[n_idx, g_idx, t] = log_probs[idx, token_id]
+            for sub_batch_idx in range(num_sub_batches):
+                sub_start = sub_batch_idx * MAX_BATCH_SIZE
+                sub_end = min(sub_start + MAX_BATCH_SIZE, num_valid)
+                sub_batch_size = sub_end - sub_start
+                
+                padded_input_ids = torch.zeros(sub_batch_size, max_len, dtype=torch.long, device=device)
+                for idx in range(sub_batch_size):
+                    ids = input_ids_list[sub_start + idx]
+                    padded_input_ids[idx, :len(ids)] = ids
+                
+                logits = model(padded_input_ids)  # (sub_batch_size, max_len, vocab_size)
+                next_token_logits = logits[:, -1, :] / SAMPLING_TEMPERATURE  # (sub_batch_size, vocab_size)
+                log_probs = torch.log_softmax(next_token_logits, dim=-1)  # (sub_batch_size, vocab_size)
+                
+                for idx in range(sub_batch_size):
+                    batch_idx = valid_indices[sub_start + idx]
+                    token_id = batch_responses[batch_idx, t].item()
+                    n_idx = batch_idx // G
+                    g_idx = batch_idx % G
+                    policy_log_probs[n_idx, g_idx, t] = log_probs[idx, token_id]
         
         return policy_log_probs
 
@@ -198,28 +208,44 @@ class Generator:
         batch_prompts = padded_prompts.repeat_interleave(G, dim=0)  # (N*G, max_prompt_len)
         batch_prompt_lengths = [prompt_lengths[i // G] for i in range(N * G)]
         
-        input_ids = batch_prompts.clone()  # (N*G, max_prompt_len)
-        batch_log_probs = []
-        finished = torch.zeros(N * G, dtype=torch.bool, device=self.device)
+        total_sequences = N * G
+        all_input_ids = []
+        all_log_probs = []
         
-        for _ in range(MAX_TOKENS):
-            logits = self.generator_model(input_ids)  # (N*G, seq_len, vocab_size)
-            next_token_logits = logits[:, -1, :]  # (N*G, vocab_size)
-            
-            log_probs = torch.log_softmax(next_token_logits, dim=-1)  # (N*G, vocab_size)
-            next_tokens = torch.multinomial(torch.exp(log_probs), num_samples=1).squeeze(1)  # (N*G,)
-            token_log_probs = log_probs.gather(1, next_tokens.unsqueeze(1)).squeeze(1)  # (N*G,)
-            batch_log_probs.append(token_log_probs)
-            
-            input_ids = torch.cat([input_ids, next_tokens.unsqueeze(1)], dim=1)  # (N*G, seq_len+1)
-            
-            for eof_token in EOF_TOKENS:
-                finished |= (next_tokens == eof_token)
-            
-            if finished.all():
-                break
+        # Process in batches if N*G exceeds MAX_BATCH_SIZE
+        num_batches = (total_sequences + MAX_BATCH_SIZE - 1) // MAX_BATCH_SIZE
         
-        batch_log_probs = torch.stack(batch_log_probs, dim=1)  # (N*G, actual_len)
+        for batch_idx in range(num_batches):
+            start_idx = batch_idx * MAX_BATCH_SIZE
+            end_idx = min(start_idx + MAX_BATCH_SIZE, total_sequences)
+            batch_size = end_idx - start_idx
+            
+            input_ids = batch_prompts[start_idx:end_idx].clone()  # (batch_size, max_prompt_len)
+            batch_log_probs = []
+            finished = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
+            
+            for _ in range(MAX_TOKENS):
+                logits = self.generator_model(input_ids)  # (batch_size, seq_len, vocab_size)
+                next_token_logits = logits[:, -1, :] / SAMPLING_TEMPERATURE  # (batch_size, vocab_size)
+                
+                log_probs = torch.log_softmax(next_token_logits, dim=-1)  # (batch_size, vocab_size)
+                next_tokens = torch.multinomial(torch.exp(log_probs), num_samples=1).squeeze(1)  # (batch_size,)
+                token_log_probs = log_probs.gather(1, next_tokens.unsqueeze(1)).squeeze(1)  # (batch_size,)
+                batch_log_probs.append(token_log_probs)
+                
+                input_ids = torch.cat([input_ids, next_tokens.unsqueeze(1)], dim=1)  # (batch_size, seq_len+1)
+                
+                for eof_token in EOF_TOKENS:
+                    finished |= (next_tokens == eof_token)
+                
+                if finished.all():
+                    break
+            
+            all_input_ids.append(input_ids)
+            all_log_probs.append(torch.stack(batch_log_probs, dim=1))  # (batch_size, actual_len)
+        
+        input_ids = torch.cat(all_input_ids, dim=0)  # (N*G, seq_len)
+        batch_log_probs = torch.cat(all_log_probs, dim=0)  # (N*G, actual_len)
         actual_len = batch_log_probs.size(1)
         
         if actual_len < MAX_TOKENS:
