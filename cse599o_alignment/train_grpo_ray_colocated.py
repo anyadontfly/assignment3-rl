@@ -332,9 +332,10 @@ class Learner:
         rewards_mean = rewards.mean(dim=1, keepdim=True)
         if USE_STD_NORMALIZATION:
             rewards_std = rewards.std(dim=1, keepdim=True)
-            return (rewards - rewards_mean) / (rewards_std + ADVANTAGE_EPS)
+            out = (rewards - rewards_mean) / (rewards_std + ADVANTAGE_EPS)
         else:
-            return rewards - rewards_mean
+            out = rewards - rewards_mean
+        return out.unsqueeze(-1)
     
     def update_policy(
         self,
@@ -347,6 +348,14 @@ class Learner:
         ref_model: Optional[Transformer]=None,
     ) -> float:
         self.optimizer.zero_grad()
+
+        old_log_probs = torch.stack(
+            [traj.log_probs for traj in trajectories]
+        )
+        response_masks = torch.stack(
+            [traj.response_masks for traj in trajectories]
+        )
+
         policy_log_probs = compute_log_probs(
             self.learner_model,
             self.tokenizer,
@@ -446,13 +455,7 @@ class ColocatedWorker(Generator, Learner):
             generation_start_event.record()
             trajectories = self.generate_trajectories(prompts)
             generation_end_event.record()
-            advantages = self.compute_advantages(trajectories).unsqueeze(-1)
-        batch_old_log_probs = torch.stack(
-            [traj.log_probs for traj in trajectories]
-        )
-        batch_response_masks = torch.stack(
-            [traj.response_masks for traj in trajectories]
-        )
+            advantages = self.compute_advantages(trajectories)
         
         with torch.cuda.nvtx.range("Learning Step"):
             learning_start_event.record()
@@ -461,8 +464,6 @@ class ColocatedWorker(Generator, Learner):
                 loss = self.update_policy(
                     trajectories,
                     advantages,
-                    batch_old_log_probs,
-                    batch_response_masks,
                     self.steps_per_rollout_batch,
                     monitor_kl_div=monitor_kl_div,
                     ref_model=self.ref_model if monitor_kl_div else None,

@@ -24,106 +24,25 @@ from cse599o_alignment.train_grpo_ray_colocated import (
 
 @ray.remote(num_gpus=1)
 class GeneratorWorker(Generator):
-    """Generator Ray actor with dedicated GPU."""
-
     def __init__(self):
-        if torch.cuda.is_available():
-            torch.set_default_device("cuda")
         super().__init__()
 
-    def generate_trajectories(self, prompts: List[str], transfer_ref=None) -> List[Trajectory]:
-        """
-        Generate trajectories, optionally waiting for weight transfer first.
-        
-        Args:
-            prompts: List of prompt strings
-            transfer_ref: Optional Ray object ref to wait for weight sync
-            
-        Returns:
-            List of Trajectory objects
-        """
-        if transfer_ref is not None:
-            ray.get(transfer_ref)
-        
-        return super().generate_trajectories(prompts)
-
-    def set_weights(self, weights):
-        """Update generator model weights from learner."""
-        self.generator_model.load_state_dict(weights)
+    def set_weights(self, state_dict: Dict[str, Any]) -> None:
         torch.cuda.synchronize()
-        return True
+        self.generator_model.load_state_dict(state_dict)
 
 
 @ray.remote(num_gpus=1)
 class LearnerWorker(Learner):
-    """Learner Ray actor with dedicated GPU."""
-
     def __init__(self):
-        if torch.cuda.is_available():
-            torch.set_default_device("cuda")
         super().__init__()
 
-    def get_weights(self, loss_ref=None):
-        """
-        Return current policy model weights.
-        
-        Args:
-            loss_ref: Optional Ray object ref to wait for loss computation
-            
-        Returns:
-            Model state dict
-        """
-        if loss_ref is not None:
-            ray.get(loss_ref)
-        
+    def get_weights(self) -> Dict[str, Any]:
         torch.cuda.synchronize()
-        return self.learner_model.state_dict()
+        return self.generator_model.state_dict()
 
 
 # ===================== Training loop =====================
-
-def train_disaggregated(
-    generator: "ray.actor.ActorHandle",
-    learner: "ray.actor.ActorHandle",
-    num_steps: int,
-    keywords: List[str],
-    prompts_per_batch: int,
-) -> float:
-    """
-    Args:
-        generator: Generator worker actor handle
-        learner: Learner worker actor handle
-        num_steps: Number of training steps
-        keywords: List of keywords for prompts
-        prompts_per_batch: Number of prompts per batch
-        
-    Returns:
-        Final loss value
-    """
-    all_keywords = keywords[:num_steps * prompts_per_batch]
-    prompts_list: List[List[str]] = [
-        make_keyword_inclusion_prompts(all_keywords[i:i + prompts_per_batch])
-        for i in range(0, len(all_keywords), prompts_per_batch)
-    ]
-
-    trajs_ref = generator.generate_trajectories.remote(prompts_list[0])
-    transfer_ref = None
-    
-    for step in range(num_steps - 1):
-        loss_ref = learner.update_policy.remote(trajs_ref)
-        trajs_ref = generator.generate_trajectories.remote(
-            prompts_list[step + 1],
-            transfer_ref=transfer_ref,
-        )
-        
-        weights_ref = learner.get_weights.remote(loss_ref=loss_ref)
-        transfer_ref = generator.set_weights.remote(weights_ref)
-    
-    loss_ref = learner.update_policy.remote(trajs_ref)
-    final_loss = ray.get(loss_ref)
-    
-    return final_loss
-
 
 def run_training(
     keywords_file: str,
@@ -153,22 +72,35 @@ def run_training(
     generator = GeneratorWorker.remote()
     learner = LearnerWorker.remote()
 
+    with open(keywords_file, "r") as f:
+        keywords = [line.strip() for line in f.readlines()]
+    prompts = make_keyword_inclusion_prompts(keywords[:prompts_per_batch])
+
     print(f"Starting disaggregated training for {num_steps} steps...")
     start_time = time.perf_counter()
     
-    final_loss = train_disaggregated(
-        generator=generator,
-        learner=learner,
-        num_steps=num_steps,
-        keywords=keywords,
-        prompts_per_batch=prompts_per_batch,
-    )
+    for _ in range(num_steps):
+        # Generate trajectories
+        trajectories = generator.generate_trajectories.remote(prompts)
+        advantages = learner.compute_advantages.remote(trajectories)
+
+        loss = learner.update_policy.remote(
+            trajectories,
+            advantages,
+            1,
+        )
+
+        updated_weights = learner.get_weights.remote()
+        ray.get(generator.set_weights.remote(updated_weights))
+
+        # Send trajectories to learner for policy update
+        loss = ray.get(loss)
     
     end_time = time.perf_counter()
     elapsed = end_time - start_time
 
     print(f"\nTraining completed!")
-    print(f"Final loss: {final_loss:.4f}")
+    print(f"Final loss: {loss:.4f}")
     print(f"Total time: {elapsed:.2f} seconds")
     print(f"Time per step: {elapsed / num_steps:.2f} seconds")
 
@@ -230,8 +162,6 @@ if __name__ == "__main__":
         required=True,
         help="Path to pretrained model checkpoint",
     )
-    parser.add_argument("--steps-per-rollout-batch", type=int, default=1)
-    parser.add_argument("--monitor-kl-div", action="store_true")
     args = parser.parse_args()
 
     import cse599o_alignment.train_grpo_ray_colocated as colocated_module
