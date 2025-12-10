@@ -241,8 +241,22 @@ class Generator:
             all_input_ids.append(input_ids)
             all_log_probs.append(torch.stack(batch_log_probs, dim=1))  # (batch_size, actual_len)
         
-        input_ids = torch.cat(all_input_ids, dim=0)  # (N*G, seq_len)
-        batch_log_probs = torch.cat(all_log_probs, dim=0)  # (N*G, actual_len)
+        max_seq_len = max_prompt_len + MAX_TOKENS
+        
+        padded_input_ids = []
+        padded_log_probs = []
+        for input_ids, log_probs in zip(all_input_ids, all_log_probs):
+            batch_size, seq_len = input_ids.shape
+            if seq_len < max_seq_len:
+                padding_ids = torch.zeros(batch_size, max_seq_len - seq_len, dtype=torch.long, device=self.device)
+                input_ids = torch.cat([input_ids, padding_ids], dim=1)
+                padding_probs = torch.zeros(batch_size, max_seq_len - seq_len, dtype=torch.float, device=self.device)
+                log_probs = torch.cat([log_probs, padding_probs], dim=1)
+            padded_input_ids.append(input_ids)
+            padded_log_probs.append(log_probs)
+        
+        input_ids = torch.cat(padded_input_ids, dim=0)  # (N*G, max_seq_len)
+        batch_log_probs = torch.cat(padded_log_probs, dim=0)  # (N*G, max_seq_len)
         actual_len = batch_log_probs.size(1)
         
         if actual_len < MAX_TOKENS:
