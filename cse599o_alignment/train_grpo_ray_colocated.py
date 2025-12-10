@@ -52,12 +52,6 @@ LOSS_TYPE = "grpo_clip"
 USE_STD_NORMALIZATION = True
 GRAD_NORM_CLIP = 1.0
 ADVANTAGE_EPS = 1e-8
-OPTIM_ARGS = {
-    "lr": 5e-4,
-    "betas": (0.9, 0.999),
-    "eps": 1e-8,
-    "weight_decay": 0.01,
-}
 
 
 logger = logging.getLogger(__name__)
