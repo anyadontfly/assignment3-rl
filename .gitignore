@@ -13,6 +13,9 @@ __pycache__/
 # PyTorch checkpoints
 *.pt
 
+# Nsight System files
+*.nsys-rep
+
 # C extensions
 *.so
 

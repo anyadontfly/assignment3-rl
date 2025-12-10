@@ -101,6 +101,10 @@ def compute_grpo_clip_loss(
         1.0 - cliprange,
         1.0 + cliprange,
     )
+
+    print("Ratio shape:", ratio.shape)
+    print("Advantages shape:", advantages.shape)
+
     return -torch.min(
         ratio * advantages,
         clipped_ratio * advantages,
