@@ -167,7 +167,7 @@ def compute_log_probs(model, tokenizer, device, trajectories: List[Trajectory]) 
 class Generator:
     """Base class for text generation using TransformerLM"""
 
-    def __init__(self, ckpt_path: str):
+    def __init__(self, ckpt_path: str, profile: bool=False):
         self.device = get_device()
         self.generator_model = Transformer(
             d_model=D_MODEL,
@@ -181,6 +181,10 @@ class Generator:
         )
         load_checkpoint(ckpt_path, self.generator_model, None)
         self.tokenizer = tiktoken.get_encoding("gpt2")
+        self.profile = profile
+        self.generator_stats = {
+            "generation_times": [],
+        }
 
     @torch.no_grad()
     def generate_trajectories(self, prompts: List[str]) -> List[Trajectory]:
@@ -306,11 +310,14 @@ class Generator:
             trajs.append(traj)
         
         return trajs
+    
+    def get_and_clear_generator_stats(self) -> Dict[str, Any]:
+        return {}
 
 
 class Learner:
     """Base learner class for policy gradient updates using TransformerLM."""
-    def __init__(self, ckpt_path: str):
+    def __init__(self, ckpt_path: str, profile: bool=False):
         self.device = get_device()
         self.learner_model = Transformer(
             d_model=D_MODEL,
@@ -325,6 +332,11 @@ class Learner:
         load_checkpoint(ckpt_path, self.learner_model, None)
         self.tokenizer = tiktoken.get_encoding("gpt2")
         self.optimizer = torch.optim.AdamW(self.learner_model.parameters(), 1e-5)
+        self.learner_stats = {
+            "computed_advantages_times": [],
+            "policy_update_times": [],
+        }
+        self.profile = profile
     
     def compute_advantages(self, trajectories: List[Trajectory]) -> torch.Tensor:
         """Compute advantages for GRPO."""
@@ -340,12 +352,13 @@ class Learner:
     def update_policy(
         self,
         trajectories: List[Trajectory],
-        advantages: torch.Tensor,
         steps_per_rollout_batch: int,
         monitor_kl_div: bool=False,
         ref_model: Optional[Transformer]=None,
     ) -> float:
         self.optimizer.zero_grad()
+
+        advantages = self.compute_advantages(trajectories)
 
         old_log_probs = torch.stack(
             [traj.log_probs for traj in trajectories]
@@ -402,6 +415,12 @@ class Learner:
                 print(f"KL Divergence to old policy: {kl_divs_old.item():.6f}")
 
         return loss.item()
+    
+    def get_and_clear_learner_stats(self) -> Dict[str, Any]:
+        stats = self.learner_stats.copy()
+        for key in self.learner_stats:
+            self.learner_stats[key] = []
+        return stats
 
 
 # ===================== Combined Actor =====================
@@ -414,6 +433,7 @@ class ColocatedWorker(Generator, Learner):
         ckpt_path: str,
         monitor_kl_div: bool=False,
         steps_per_rollout_batch: int=1,
+        profile: bool=False,
     ):
         if torch.cuda.is_available():
             torch.set_default_device("cuda")
@@ -421,8 +441,8 @@ class ColocatedWorker(Generator, Learner):
         self.device = get_device()
         self.monitor_kl_div = monitor_kl_div
         
-        Generator.__init__(self, ckpt_path)
-        Learner.__init__(self, ckpt_path)
+        Generator.__init__(self, ckpt_path, profile=profile)
+        Learner.__init__(self, ckpt_path, profile=profile)
         if monitor_kl_div:
             self.ref_model = Transformer(
                 d_model=D_MODEL,
@@ -434,10 +454,11 @@ class ColocatedWorker(Generator, Learner):
                 rope_theta=THETA,
                 device=self.device,
             )
-            load_checkpoint(CHECKPOINT_PATH, self.ref_model, None)
+            load_checkpoint(ckpt_path, self.ref_model, None)
         
         self.step_count = 0
         self.steps_per_rollout_batch = steps_per_rollout_batch
+        self.profile = profile
         self.sync_models()
 
     def sync_models(self):
@@ -447,55 +468,48 @@ class ColocatedWorker(Generator, Learner):
     
     def training_step(self, prompts: List[str], monitor_kl_div: bool=False):
         """Perform one complete training step: generate rollout + update policy."""
-        generation_start_event = torch.cuda.Event(enable_timing=True)
-        generation_end_event = torch.cuda.Event(enable_timing=True)
-        learning_start_event = torch.cuda.Event(enable_timing=True)
-        learning_end_event = torch.cuda.Event(enable_timing=True)
-        weight_sync_start_event = torch.cuda.Event(enable_timing=True)
-        weight_sync_end_event = torch.cuda.Event(enable_timing=True)
+        step_start_time = time.perf_counter()
 
-        with torch.cuda.nvtx.range("Generating Step"):
-            generation_start_event.record()
-            trajectories = self.generate_trajectories(prompts)
-            generation_end_event.record()
-            advantages = self.compute_advantages(trajectories)
+        trajectories = self.generate_trajectories(prompts)
+        gen_traj_end_time = time.perf_counter()
         
-        with torch.cuda.nvtx.range("Learning Step"):
-            learning_start_event.record()
-            loss = -1.0
-            for _ in range(self.steps_per_rollout_batch):
-                loss = self.update_policy(
-                    trajectories,
-                    advantages,
-                    self.steps_per_rollout_batch,
-                    monitor_kl_div=monitor_kl_div,
-                    ref_model=self.ref_model if monitor_kl_div else None,
-                )
-            learning_end_event.record()
+        loss = -1.0
+        for _ in range(self.steps_per_rollout_batch):
+            loss = self.update_policy(
+                trajectories,
+                self.steps_per_rollout_batch,
+                monitor_kl_div=monitor_kl_div,
+                ref_model=self.ref_model if monitor_kl_div else None,
+            )
+        policy_update_end_time = time.perf_counter()
 
-        with torch.cuda.nvtx.range("Weight Sync Step"):
-            weight_sync_start_event.record()
-            self.sync_models()
-            weight_sync_end_event.record()
+        self.sync_models()
         torch.cuda.synchronize()
-
-        generation_time = generation_start_event.elapsed_time(generation_end_event)
-        learning_time = learning_start_event.elapsed_time(learning_end_event)
-        weight_sync_time = weight_sync_start_event.elapsed_time(weight_sync_end_event)
+        step_end_time = time.perf_counter()
+        
+        wall_time = (step_end_time - step_start_time) * 1000
+        gen_traj_time = (gen_traj_end_time - step_start_time) * 1000
+        policy_update_time = (policy_update_end_time - gen_traj_end_time) * 1000
+        sync_weights_time = (step_end_time - policy_update_end_time) * 1000
 
         self.step_count += 1
         avg_reward = torch.stack([traj.rewards for traj in trajectories]).mean().item()
-        print(f"Step {self.step_count}: Loss = {loss:.4f}, avg rewards: {avg_reward:.4f}")
-        print(f"  Generation time: {generation_time:.2f} ms")
-        print(f"  Learning time: {learning_time:.2f} ms")
-        print(f"  Weight sync time: {weight_sync_time:.2f} ms")
+        print(f"Step {self.step_count}: \n"
+              f"wall time = {wall_time:.4f} ms, \n"
+              f"gen traj time = {gen_traj_time:.4f} ms, \n"
+              f"policy update time = {policy_update_time:.4f} ms, \n"
+              f"sync weights time = {sync_weights_time:.4f} ms. \n"
+              f"Loss = {loss:.4f}, avg rewards: {avg_reward:.4f}")
     
     def get_statistics(self) -> Dict[str, Any]:
         """Get current training statistics."""
-        return {
-            'step_count': self.step_count,
-            'model_parameters': sum(p.numel() for p in self.learner_model.parameters()) if hasattr(self, 'model') else 0
-        }
+        if self.profile:
+            learner_stats = self.get_and_clear_learner_stats()
+            generator_stats = self.get_and_clear_generator_stats()
+            stats = {**learner_stats, **generator_stats}
+            return stats
+        else:
+            return {}
 
 
 # ===================== Training loop =====================
@@ -508,12 +522,14 @@ def run_training(
     monitor_kl_div: bool=False,
     prompts_per_batch: int=4,
     steps_per_rollout_batch: int=1,
+    profile: bool=False,
 ):
     """Run colocated GRPO training with text generation."""
     worker = ColocatedWorker.remote(
         ckpt_path=ckpt_path,
         monitor_kl_div=monitor_kl_div,
         steps_per_rollout_batch=steps_per_rollout_batch,
+        profile=profile,
     )
     for step in range(0, num_steps, steps_per_rollout_batch):
         # start_idx = step * prompts_per_batch * steps_per_rollout_batch
@@ -529,6 +545,7 @@ def run_once(
     monitor_kl_div: bool=False,
     prompts_per_batch: int=4,
     steps_per_rollout_batch: int=1,
+    profile: bool=False,
 ):
     """Entry point for training."""
     with open(keywords_file, "r") as f:
@@ -542,6 +559,7 @@ def run_once(
         monitor_kl_div=monitor_kl_div,
         prompts_per_batch=prompts_per_batch,
         steps_per_rollout_batch=steps_per_rollout_batch,
+        profile=profile,
     )
 
 
@@ -565,6 +583,8 @@ if __name__ == "__main__":
                         help="Temporary directory for Ray")
     parser.add_argument("--pretrained-ckpt-path", type=str, required=True,
                        help="Path to pretrained model checkpoint")
+    parser.add_argument("--profile", action="store_true",
+                       help="Whether to enable profiling")
     args = parser.parse_args()
     
     ray.init(
@@ -596,6 +616,7 @@ if __name__ == "__main__":
             monitor_kl_div=args.monitor_kl_div,
             prompts_per_batch=args.prompts_per_batch,
             steps_per_rollout_batch=args.steps_per_rollout_batch,
+            profile=args.profile,
         )
     finally:
         ray.shutdown()

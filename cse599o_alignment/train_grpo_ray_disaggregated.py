@@ -57,6 +57,8 @@ def run_training(
     num_workers: int = 2,
     prompts_per_batch: int = 4,
     use_rdt: bool = False,
+    steps_per_rollout_batch: int = 1,
+    profile: bool = False,
 ) -> None:
     """
     Run disaggregated GRPO training.
@@ -67,6 +69,7 @@ def run_training(
         num_steps: Number of training steps
         num_workers: Must be 2 (generator + learner)
         prompts_per_batch: Number of prompts per batch
+        steps_per_rollout_batch: Number of policy update steps per rollout batch
     """
     if num_workers != 2:
         raise ValueError("Disaggregated training requires exactly 2 workers (generator + learner)")
@@ -86,39 +89,51 @@ def run_training(
 
     with open(keywords_file, "r") as f:
         keywords = [line.strip() for line in f.readlines()]
-    prompts = make_keyword_inclusion_prompts(keywords[:prompts_per_batch])
+    prompts = make_keyword_inclusion_prompts(keywords[:prompts_per_batch * steps_per_rollout_batch])
 
-    print(f"Starting disaggregated training for {num_steps} steps...")
-    start_time = time.perf_counter()
+    time_start = time.perf_counter()
+
+    # Generate first batch of trajs
+    trajectories_ref = generator.generate_trajectories.remote(prompts)
     
-    for _ in range(num_steps):
-        # Generate trajectories
-        trajectories = generator.generate_trajectories.remote(prompts)
-        advantages = learner.compute_advantages.remote(trajectories)
+    for step_count in range(num_steps - 1):
 
-        loss = learner.update_policy.remote(
-            trajectories,
-            advantages,
-            1,
-        )
+        for _ in range(steps_per_rollout_batch):
+            loss_ref = learner.update_policy.remote(
+                trajectories_ref,
+                steps_per_rollout_batch,
+            )
 
+        if profile:
+            ray.get(loss_ref)
+
+        trajectories_ref = generator.generate_trajectories.remote(prompts)
+
+        if profile:
+            transfer_start = time.perf_counter()
+        
         if use_rdt:
             updated_weights = learner.get_weights_rdt.remote()
         else:
             updated_weights = learner.get_weights.remote()
+        
+        # guarantee at most one version behind
         ray.get(generator.set_weights.remote(updated_weights))
+        if profile:
+            transfer_end = time.perf_counter()
+            print(f"Weight transfer time at step {step_count + 1}: {(transfer_end - transfer_start)*1000:.4f} ms.", flush=True)
+        print(f"Step {step_count + 1} weights transferred.", flush=True)
 
-        # Send trajectories to learner for policy update
-        loss = ray.get(loss)
-    
-    end_time = time.perf_counter()
-    elapsed = end_time - start_time
+    for _ in range(steps_per_rollout_batch):
+        loss_ref = learner.update_policy.remote(
+            trajectories_ref,
+            steps_per_rollout_batch,
+        )
+    print(f"Step {num_steps} weights transferred.", flush=True)
+    ray.get(loss_ref)
 
-    print(f"\nTraining completed!")
-    print(f"Final loss: {loss:.4f}")
-    print(f"Total time: {elapsed:.2f} seconds")
-    print(f"Time per step: {elapsed / num_steps:.2f} seconds")
-
+    time_end = time.perf_counter()
+    print(f"{num_steps} disaggregated training completed in {(time_end - time_start)*1000:.4f} ms.")
 
 def run_once(
     ckpt_path: str,
@@ -127,7 +142,8 @@ def run_once(
     num_workers: int = 2,
     prompts_per_batch: int = 4,
     use_rdt: bool = False,
-    **kwargs
+    steps_per_rollout_batch: int = 1,
+    profile: bool = False,
 ):
     """Entry point for disaggregated training."""
     run_training(
@@ -137,6 +153,8 @@ def run_once(
         num_workers=num_workers,
         prompts_per_batch=prompts_per_batch,
         use_rdt=use_rdt,
+        steps_per_rollout_batch=steps_per_rollout_batch,
+        profile=profile,
     )
 
 
@@ -182,9 +200,20 @@ if __name__ == "__main__":
         help="Path to pretrained model checkpoint",
     )
     parser.add_argument(
+        "--steps-per-rollout-batch",
+        type=int,
+        default=1,
+        help="Number of policy update steps per rollout batch",
+    )
+    parser.add_argument(
         "--use-rdt",
         action="store_true",
         help="Use Ray Distributed Tensor (RDT) for weight transfer",
+    )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Enable profiling",
     )
     args = parser.parse_args()
 
@@ -217,6 +246,8 @@ if __name__ == "__main__":
             num_workers=args.workers,
             prompts_per_batch=args.prompts_per_batch,
             use_rdt=args.use_rdt,
+            steps_per_rollout_batch=args.steps_per_rollout_batch,
+            profile=args.profile,
         )
     finally:
         ray.shutdown()
