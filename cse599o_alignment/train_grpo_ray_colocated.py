@@ -36,7 +36,7 @@ from cse599o_alignment.grpo import grpo_microbatch_train_step
 # ===================== Basic setup =====================
 
 G = 4  # group size (number of responses per prompt)
-MAX_BATCH_SIZE = 16
+MAX_BATCH_SIZE = 128
 VOCAB_SIZE = tiktoken.get_encoding("gpt2").n_vocab
 CONTEXT_LENGTH = 256
 NUM_LAYERS = 4
@@ -52,6 +52,12 @@ LOSS_TYPE = "grpo_clip"
 USE_STD_NORMALIZATION = True
 GRAD_NORM_CLIP = 1.0
 ADVANTAGE_EPS = 1e-8
+OPTIM_ARGS = {
+    "lr": 5e-4,
+    "betas": (0.9, 0.999),
+    "eps": 1e-8,
+    "weight_decay": 0.01,
+}
 
 
 logger = logging.getLogger(__name__)
@@ -324,7 +330,7 @@ class Learner:
         )
         load_checkpoint(CHECKPOINT_PATH, self.learner_model, None)
         self.tokenizer = tiktoken.get_encoding("gpt2")
-        self.optimizer = torch.optim.AdamW(self.learner_model.parameters(), lr=5e-4)
+        self.optimizer = torch.optim.AdamW(self.learner_model.parameters(), **OPTIM_ARGS)
     
     def compute_advantages(self, trajectories: List[Trajectory]) -> torch.Tensor:
         """Compute advantages for GRPO."""
@@ -480,7 +486,8 @@ class ColocatedWorker(Generator, Learner):
         weight_sync_time = weight_sync_start_event.elapsed_time(weight_sync_end_event)
 
         self.step_count += 1
-        print(f"Step {self.step_count}: Loss = {loss:.4f}, avg rewards: {torch.mean(torch.stack([traj.rewards.mean() for traj in trajectories])).item():.4f}")
+        avg_reward = torch.stack([traj.rewards for traj in trajectories]).mean().item()
+        print(f"Step {self.step_count}: Loss = {loss:.4f}, avg rewards: {avg_reward:.4f}")
         print(f"  Generation time: {generation_time:.2f} ms")
         print(f"  Learning time: {learning_time:.2f} ms")
         print(f"  Weight sync time: {weight_sync_time:.2f} ms")
@@ -506,9 +513,9 @@ def run_training(
     """Run colocated GRPO training with text generation."""
     worker = ColocatedWorker.remote(monitor_kl_div=monitor_kl_div, steps_per_rollout_batch=steps_per_rollout_batch)
     for step in range(0, num_steps, steps_per_rollout_batch):
-        start_idx = step * prompts_per_batch * steps_per_rollout_batch
-        end_idx = start_idx + prompts_per_batch * steps_per_rollout_batch
-        prompts_step = prompts[start_idx:end_idx]
+        # start_idx = step * prompts_per_batch * steps_per_rollout_batch
+        # end_idx = start_idx + prompts_per_batch * steps_per_rollout_batch
+        prompts_step = prompts[0:prompts_per_batch * steps_per_rollout_batch]
         ray.get(worker.training_step.remote(prompts_step, monitor_kl_div=monitor_kl_div))
 
 def run_once(
