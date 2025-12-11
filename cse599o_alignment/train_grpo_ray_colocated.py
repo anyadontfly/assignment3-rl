@@ -187,7 +187,7 @@ class Generator:
         }
 
     @torch.no_grad()
-    def generate_trajectories(self, prompts: List[str]) -> List[Trajectory]:
+    def generate_trajectories(self, prompts: List[str], **kwargs) -> List[Trajectory]:
         """
         Generate G responses for each prompt using TransformerLM.
 
@@ -359,7 +359,7 @@ class Learner:
     ) -> float:
         self.optimizer.zero_grad()
 
-        div = len(trajectories) // self.steps_per_rollout_batch
+        div = len(trajectories) // steps_per_rollout_batch
         rollout_step_trajectories = trajectories[step_index * div:(step_index + 1) * div]
 
         advantages = self.compute_advantages(rollout_step_trajectories)

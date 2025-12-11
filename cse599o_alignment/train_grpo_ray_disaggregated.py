@@ -38,12 +38,12 @@ class LearnerWorker(Learner):
     def __init__(self, ckpt_path: str,):
         super().__init__(ckpt_path)
 
-    def get_weights(self) -> Dict[str, Any]:
+    def get_weights(self, *args) -> Dict[str, Any]:
         torch.cuda.synchronize()
         return self.learner_model.state_dict()
     
     @ray.method(tensor_transport="nccl")
-    def get_weights_rdt(self) -> Dict[str, Any]:
+    def get_weights_rdt(self, *args) -> Dict[str, Any]:
         torch.cuda.synchronize()
         return self.learner_model.state_dict()
 
@@ -97,8 +97,9 @@ def run_training(
 
     # Generate first batch of trajs
     trajectories_ref = generator.generate_trajectories.remote(prompts)
-    
-    for step_count in range(num_steps - 1):
+    weight_recv_ref = None    
+
+    for _ in range(num_steps - 1):
 
         for i in range(steps_per_rollout_batch):
             loss_ref = learner.update_policy.remote(
@@ -107,26 +108,14 @@ def run_training(
                 steps_per_rollout_batch,
             )
 
-        if profile:
-            ray.get(loss_ref)
-
-        trajectories_ref = generator.generate_trajectories.remote(prompts)
-
-        if profile:
-            transfer_start = time.perf_counter()
+        trajectories_ref = generator.generate_trajectories.remote(prompts, weight_recv_ref=weight_recv_ref)
         
         if use_rdt:
-            updated_weights = learner.get_weights_rdt.remote()
+            weight_send_ref = learner.get_weights_rdt.remote(loss_ref)
         else:
-            updated_weights = learner.get_weights.remote()
+            weight_send_ref = learner.get_weights.remote(loss_ref)
         
-        # guarantee at most one version behind
-        ray.get(generator.set_weights.remote(updated_weights))
-        if profile:
-            transfer_end = time.perf_counter()
-            print(f"Weight transfer time at step {step_count + 1}: {(transfer_end - transfer_start)*1000:.4f} ms.", flush=True)
-        else:
-            print(f"Step {step_count + 1} weights transferred.", flush=True)
+        weight_recv_ref = generator.set_weights.remote(weight_send_ref)
 
     for i in range(steps_per_rollout_batch):
         loss_ref = learner.update_policy.remote(
@@ -134,7 +123,6 @@ def run_training(
             trajectories_ref,
             steps_per_rollout_batch,
         )
-    print(f"Step {num_steps} weights transferred.", flush=True)
     ray.get(loss_ref)
 
     time_end = time.perf_counter()
