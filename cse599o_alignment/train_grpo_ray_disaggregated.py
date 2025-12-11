@@ -93,13 +93,16 @@ def run_training(
 
     time_start = time.perf_counter()
 
+    num_steps = num_steps // steps_per_rollout_batch
+
     # Generate first batch of trajs
     trajectories_ref = generator.generate_trajectories.remote(prompts)
     
     for step_count in range(num_steps - 1):
 
-        for _ in range(steps_per_rollout_batch):
+        for i in range(steps_per_rollout_batch):
             loss_ref = learner.update_policy.remote(
+                i,
                 trajectories_ref,
                 steps_per_rollout_batch,
             )
@@ -125,8 +128,9 @@ def run_training(
         else:
             print(f"Step {step_count + 1} weights transferred.", flush=True)
 
-    for _ in range(steps_per_rollout_batch):
+    for i in range(steps_per_rollout_batch):
         loss_ref = learner.update_policy.remote(
+            i,
             trajectories_ref,
             steps_per_rollout_batch,
         )

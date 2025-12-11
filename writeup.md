@@ -12,7 +12,25 @@ In my results, KL divergence grows exponentially at early stage and then remains
 
 ## Problem 7
 ![normalized time](timing_by_k.png)
-According to the normalized time breakd own plot, there is speed up in normalized time for k=2 comparing to k=1. However, the normalized time increases as k increases to larger numbers. The reason for this is because trajectory generation can be batched for larger k but advantage and log prob calculation are repeated k times which can not be batched. This is why normalized generation time is decreasing while learning time increases with proportion of k.
+There are intotal 512 samples processed (32 steps, group size 4, rollout batch size 4). 
+| k value | Throughput (samples/sec) |
+|---------|--------------------------|
+|    1     |            25.37              |
+|    2     |             35.53             |
+|    4     |             41.83             |
+|    8     |             41.96             |
+
+| k value | Speedup |
+|---------|---------|
+|    1    |   1.00x |
+|    2    |   1.40x |
+|    4    |   1.65x |
+|    8    |   1.65x |
+
+As k increases, throughput improves due to better batching efficiency, with speedup plateauing around k=4.
+
+## Problem 8
+
 
 
 ## Problem 9

@@ -351,6 +351,7 @@ class Learner:
     
     def update_policy(
         self,
+        step_index: int,
         trajectories: List[Trajectory],
         steps_per_rollout_batch: int,
         monitor_kl_div: bool=False,
@@ -358,20 +359,23 @@ class Learner:
     ) -> float:
         self.optimizer.zero_grad()
 
-        advantages = self.compute_advantages(trajectories)
+        div = len(trajectories) // self.steps_per_rollout_batch
+        rollout_step_trajectories = trajectories[step_index * div:(step_index + 1) * div]
+
+        advantages = self.compute_advantages(rollout_step_trajectories)
 
         old_log_probs = torch.stack(
-            [traj.log_probs for traj in trajectories]
+            [traj.log_probs for traj in rollout_step_trajectories]
         )
         response_masks = torch.stack(
-            [traj.response_masks for traj in trajectories]
+            [traj.response_masks for traj in rollout_step_trajectories]
         )
 
         policy_log_probs = compute_log_probs(
             self.learner_model,
             self.tokenizer,
             self.device,
-            trajectories,
+            rollout_step_trajectories,
         )
         
         loss, _ = grpo_microbatch_train_step(
@@ -393,14 +397,14 @@ class Learner:
                     ref_model,
                     self.tokenizer,
                     self.device,
-                    trajectories,
+                    rollout_step_trajectories,
                 )
 
                 updated_policy_log_probs = compute_log_probs(
                     self.learner_model,
                     self.tokenizer,
                     self.device,
-                    trajectories,
+                    rollout_step_trajectories,
                 )
 
                 mask = response_masks
@@ -475,10 +479,9 @@ class ColocatedWorker(Generator, Learner):
         
         loss = -1.0
         for i in range(self.steps_per_rollout_batch):
-            div = len(trajectories) // self.steps_per_rollout_batch
-            rollout_step_trajectories = trajectories[i * div:(i + 1) * div]
             loss = self.update_policy(
-                rollout_step_trajectories,
+                i,
+                trajectories,
                 self.steps_per_rollout_batch,
                 monitor_kl_div=monitor_kl_div,
                 ref_model=self.ref_model if monitor_kl_div else None,
