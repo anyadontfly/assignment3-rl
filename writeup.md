@@ -1,4 +1,5 @@
 ## Problem 5
+![normalized time](colocated_timing_breakdown.png)
 1. Generation stage takes longer time than policy update stage. This is because during generation stage, the model have to run forward path for every generated token in autoregressive generation fashion. The update stage includs policy log prob calculation, backward computation, and optimizer step. However, log prob calculation can be batched and only run one forward to get log prob for every token, which is much more efficient than generation stage. 
 2. Prompt: Write a story that includes the word: sound  
 Response: Her dad smiled and said: "I didn't know, the birds were talking! How does that sound?"The old man and his dadre at the same time in the tree when the sky was full of colorful stars.<|endoftext|>Once upon a time, there was a big fish named Bob  
@@ -30,7 +31,14 @@ There are intotal 512 samples processed (32 steps, group size 4, rollout batch s
 As k increases, throughput improves due to better batching efficiency, with speedup plateauing around k=4.
 
 ## Problem 8
+| k value | Colocated (ms) | Disaggregated (ms) |
+|---------|----------------|-------------------|
+|    1    |   20218.25     |   55358.88        |
+|    2    |   14400.43     |   44884.53        |
+|    4    |   12424.44     |   81736.95        |
+|    8    |   12292.58     |   83611.88        |
 
+The disaggregated setup shows higher latency compared to the colocated configuration across all k values, with the gap widening significantly at k=4 and k=8.
 
 
 ## Problem 9

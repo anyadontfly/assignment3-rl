@@ -37,10 +37,11 @@ def run_create_trajectory(
         from cse599o_alignment.train_grpo_ray_colocated import Trajectory
         
         traj = Trajectory(
-            prompts=prompts,
+            prompt=prompts,
             responses=responses,
             rewards=rewards,
             log_probs=log_probs,
+            response_masks=torch.ones_like(log_probs),
             values=values
         )
         
@@ -48,7 +49,7 @@ def run_create_trajectory(
         result = {
             'rewards': traj.rewards,
             'log_probs': traj.log_probs,
-            'num_prompts': len(traj.prompts),
+            'num_prompts': len(traj.prompt),
             'num_responses': len(traj.responses),
             'rewards_shape': traj.rewards.shape,
             'log_probs_shape': traj.log_probs.shape

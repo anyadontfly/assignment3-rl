@@ -85,12 +85,14 @@ class Trajectory:
         log_probs: torch.Tensor,  # (G, MAX_TOKENS)
         rewards: torch.Tensor,  # (G,)
         response_masks: torch.Tensor,  # (G, MAX_TOKENS)
+        values=None,
     ):
         self.prompt = prompt
         self.responses = responses
         self.log_probs = log_probs
         self.rewards = rewards
         self.response_masks = response_masks
+        self.values = values
 
 
 def compute_log_probs(model, tokenizer, device, trajectories: List[Trajectory]) -> torch.Tensor:
